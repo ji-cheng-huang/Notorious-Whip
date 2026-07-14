@@ -4,6 +4,16 @@ const fs = require('fs');
 const os = require('os');
 const { execFile } = require('child_process');
 
+// ── Single-instance lock ──────────────────────────────────────────────────────
+// The launcher runs detached, so without this every `openwhip` / `npm start`
+// would stack another invisible background tray app. If we don't get the lock,
+// a copy is already running: bail immediately and ask it to pop a whip instead.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return;
+}
+app.on('second-instance', () => { try { toggleOverlay(); } catch (e) {} });
+
 // ── Win32 FFI (Windows only) ────────────────────────────────────────────────
 let keybd_event, VkKeyScanA;
 if (process.platform === 'win32') {
@@ -21,6 +31,7 @@ if (process.platform === 'win32') {
 let tray, overlay;
 let overlayReady = false;
 let spawnQueued = false;
+let macroBusy = false; // serialize interrupt+type so rapid cracks don't clobber each other
 
 const VK_CONTROL = 0x11;
 const VK_RETURN  = 0x0D;
@@ -121,8 +132,30 @@ async function getTrayIcon() {
 }
 
 // ── Overlay window ──────────────────────────────────────────────────────────
+/** Union of ALL displays (the whole virtual desktop). Covering everything with
+ *  one window means the cursor never leaves the overlay — so moving between
+ *  monitors is continuous instead of a huge coordinate jump that blows up the
+ *  whip physics and crashes the GPU. Also lets you whip across every screen. */
+function virtualDesktopBounds() {
+  try {
+    const displays = screen.getAllDisplays();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const d of displays) {
+      const b = d.bounds;
+      minX = Math.min(minX, b.x);
+      minY = Math.min(minY, b.y);
+      maxX = Math.max(maxX, b.x + b.width);
+      maxY = Math.max(maxY, b.y + b.height);
+    }
+    if (!Number.isFinite(minX)) return screen.getPrimaryDisplay().bounds;
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  } catch {
+    return screen.getPrimaryDisplay().bounds;
+  }
+}
+
 function createOverlay() {
-  const { bounds } = screen.getPrimaryDisplay();
+  const bounds = virtualDesktopBounds();
   overlay = new BrowserWindow({
     x: bounds.x, y: bounds.y,
     width: bounds.width, height: bounds.height,
@@ -138,6 +171,15 @@ function createOverlay() {
     },
   });
   overlay.setAlwaysOnTop(true, 'screen-saver');
+  // macOS: native-fullscreen apps live in their own Space, so a plain
+  // always-on-top window never shows over them. Joining all Spaces +
+  // visibleOnFullScreen lets the whip appear over fullscreen apps too.
+  if (process.platform === 'darwin') {
+    overlay.setVisibleOnAllWorkspaces(true, {
+      visibleOnFullScreen: true,
+      skipTransformProcessType: true,
+    });
+  }
   overlayReady = false;
   overlay.loadFile('overlay.html');
   overlay.webContents.on('did-finish-load', () => {
@@ -161,6 +203,10 @@ function toggleOverlay() {
     return;
   }
   if (!overlay) createOverlay();
+  // Re-anchor to the full virtual desktop before showing (handles monitors
+  // being plugged in/out or rearranged since the window was created).
+  const b = virtualDesktopBounds();
+  overlay.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
   overlay.show();
   if (overlayReady) {
     overlay.webContents.send('spawn-whip');
@@ -179,9 +225,23 @@ ipcMain.on('whip-crack', () => {
   }
 });
 ipcMain.on('hide-overlay', () => { if (overlay) overlay.hide(); });
+// Read a bundled sound file for the sandboxed renderer (Web Audio decode).
+// basename() blocks path escapes; returns null if the file is missing.
+ipcMain.handle('read-sound', (_e, name) => {
+  try {
+    return fs.readFileSync(path.join(__dirname, 'sounds', path.basename(String(name || ''))));
+  } catch {
+    return null;
+  }
+});
 
 // ── Macro: immediate Ctrl+C, type "Go FASER", Enter ───────────────────────
 function sendMacro() {
+  // Ignore cracks that arrive while a previous macro is still typing. Two
+  // concurrent System Events keystroke sessions race and silently drop
+  // characters, which is why input sometimes never reached the agent.
+  if (macroBusy) return;
+
   // Pick a random phrase from a list of similar phrases and type it out
   const phrases = [
     'FASTER',
@@ -194,17 +254,35 @@ function sendMacro() {
   ];
   const chosen = phrases[Math.floor(Math.random() * phrases.length)];
 
-  if (process.platform === 'win32') {
-    sendMacroWindows(chosen);
-  } else if (process.platform === 'darwin') {
-    sendMacroMac(chosen);
-  } else if (process.platform === 'linux') {
-    sendMacroLinux(chosen);
+  macroBusy = true;
+  // Watchdog: never let a dropped callback wedge macroBusy=true forever.
+  let finished = false;
+  const watchdog = setTimeout(() => finish(), 3000);
+  function finish() {
+    if (finished) return;
+    finished = true;
+    clearTimeout(watchdog);
+    macroBusy = false;
+  }
+
+  try {
+    if (process.platform === 'win32') {
+      sendMacroWindows(chosen, finish);
+    } else if (process.platform === 'darwin') {
+      sendMacroMac(chosen, finish);
+    } else if (process.platform === 'linux') {
+      sendMacroLinux(chosen, finish);
+    } else {
+      finish();
+    }
+  } catch (e) {
+    console.warn('sendMacro failed:', e?.message || e);
+    finish();
   }
 }
 
-function sendMacroWindows(text) {
-  if (!keybd_event || !VkKeyScanA) return;
+function sendMacroWindows(text, done = () => {}) {
+  if (!keybd_event || !VkKeyScanA) return done();
   const tapKey = vk => {
     keybd_event(vk, 0, 0, 0);
     keybd_event(vk, 0, KEYUP, 0);
@@ -227,39 +305,33 @@ function sendMacroWindows(text) {
   for (const ch of text) tapChar(ch);
   keybd_event(VK_RETURN, 0, 0, 0);
   keybd_event(VK_RETURN, 0, KEYUP, 0);
+  done();
 }
 
-function sendMacroMac(text) {
+function sendMacroMac(text, done = () => {}) {
   const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const interruptScript = [
+  // Do interrupt → type → submit inside ONE System Events session so focus is
+  // consistent throughout. Internal delays let the agent settle after Ctrl+C and
+  // register the typed text before Return — otherwise the phrase just sits in the
+  // input box instead of being sent.
+  const script = [
     'tell application "System Events"',
     '  key code 8 using {control down}', // Ctrl+C interrupt
-    'end tell'
-  ].join('\n');
-  const typeAndEnterScript = [
-    'tell application "System Events"',
+    '  delay 0.3',
     `  keystroke "${escaped}"`,
-    '  key code 36', // Enter
-    'end tell'
+    '  delay 0.2',
+    '  key code 36', // Return / submit
+    'end tell',
   ].join('\n');
-
-  execFile('osascript', ['-e', interruptScript], err => {
+  execFile('osascript', ['-e', script], err => {
     if (err) {
       console.warn('mac macro failed (enable Accessibility for terminal/app):', err.message);
-      return;
     }
-
-    setTimeout(() => {
-      execFile('osascript', ['-e', typeAndEnterScript], err2 => {
-        if (err2) {
-          console.warn('mac macro failed (enable Accessibility for terminal/app):', err2.message);
-        }
-      });
-    }, 300);
+    done();
   });
 }
 
-function sendMacroLinux(text) {
+function sendMacroLinux(text, done = () => {}) {
   execFile(
     'xdotool',
     [
@@ -271,12 +343,18 @@ function sendMacroLinux(text) {
       if (err) {
         console.warn('linux macro failed. Install xdotool:', err.message);
       }
+      done();
     }
   );
 }
 
 // ── App lifecycle ───────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
+  // Tray-only utility: hide from the Dock and run as an accessory app. This
+  // also stops activating OpenWhip from kicking a fullscreen app out of its
+  // Space when the overlay appears.
+  if (process.platform === 'darwin' && app.dock) app.dock.hide();
+
   tray = new Tray(await getTrayIcon());
   tray.setToolTip('OpenWhip - click for whip');
   tray.setContextMenu(

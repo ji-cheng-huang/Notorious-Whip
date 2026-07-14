@@ -41,7 +41,7 @@
     "README.md"
   ],
   "scripts": {
-    "start": "electron .",
+    "start": "node bin/openwhip.js",
     "dev": "electron .",
     "pack": "npm pack"
   },

@@ -87,8 +87,28 @@ let handleAngVel = 0;
 
 const WHIP_CRACK_SOUNDS = ['sounds/A.mp3', 'sounds/B.mp3', 'sounds/C.mp3', 'sounds/D.mp3', 'sounds/E.mp3'];
 
+// 館長 roar. If a recording exists at sounds/guanzhang.mp3 we decode it once,
+// then each strike plays only the loudest ~window-sec slice (auto-trim) with
+// fades, retriggering so rapid whips don't pile up. No file / decode failure
+// falls back to the synthesized growl below.
+const GUANZHANG_FILE = 'guanzhang.mp3';
+const GUANZHANG_WINDOW_SEC = 1.1; // how much of the clip each strike plays
+const guanzhang = { state: 'idle', buffer: null, window: null }; // idle|loading|ready|none
+let activeGuanzhang = null; // currently-playing source, for retrigger
+
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+
 document.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 document.addEventListener('mousedown', () => {
+  ensureGuanzhang(); // unlock audio + kick off decode
   if (whip && !dropping) dropping = true;
 });
 
@@ -165,6 +185,149 @@ function playCrackSound() {
   const src = WHIP_CRACK_SOUNDS[Math.floor(Math.random() * WHIP_CRACK_SOUNDS.length)];
   const a = new Audio(src);
   a.play().catch(() => {});
+}
+
+// Decode the 館長 file once and find its punchiest window. Safe to call often;
+// only the first call does work. Runs off a user gesture / whip spawn so audio
+// is ready by the first crack.
+function ensureGuanzhang() {
+  if (guanzhang.state !== 'idle') return;
+  const ctx = getAudioCtx();
+  const read = window.bridge && window.bridge.readSound;
+  if (!ctx || !read) { guanzhang.state = 'none'; return; }
+  guanzhang.state = 'loading';
+  // readSound resolves to a Uint8Array (Buffer over IPC); decodeAudioData wants
+  // a standalone ArrayBuffer, so copy out the exact byte range.
+  Promise.resolve()
+    .then(() => read(GUANZHANG_FILE))
+    .then(bytes => {
+      if (!bytes || !bytes.byteLength) { guanzhang.state = 'none'; return; }
+      const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return ctx.decodeAudioData(ab).then(buf => {
+        guanzhang.buffer = buf;
+        guanzhang.window = loudestWindow(buf, GUANZHANG_WINDOW_SEC);
+        guanzhang.state = 'ready';
+      });
+    })
+    .catch(() => { guanzhang.state = 'none'; });
+}
+
+// Slide a fixed-length window across the clip and return the highest-energy
+// (loudest) one — that's the RRRR we want, wherever it sits in the file.
+function loudestWindow(buf, maxSec) {
+  const sr = buf.sampleRate;
+  const data = buf.getChannelData(0);
+  const n = data.length;
+  const winLen = Math.min(Math.max(1, Math.floor(maxSec * sr)), n);
+  const step = Math.max(1, Math.floor(sr * 0.02)); // 20ms hops
+  let sum = 0;
+  for (let i = 0; i < winLen; i++) sum += data[i] * data[i];
+  let bestStart = 0, bestSum = sum;
+  for (let start = step; start + winLen <= n; start += step) {
+    for (let i = start - step; i < start; i++) sum -= data[i] * data[i];
+    for (let i = start - step + winLen; i < start + winLen; i++) sum += data[i] * data[i];
+    if (sum > bestSum) { bestSum = sum; bestStart = start; }
+  }
+  return { offsetSec: bestStart / sr, lengthSec: winLen / sr };
+}
+
+// 館長 RRRRRRR — plays on every whip strike, layered over the crack.
+function playGuanzhang() {
+  ensureGuanzhang();
+  if (guanzhang.state !== 'ready') return synthGuanzhang();
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const { offsetSec, lengthSec } = guanzhang.window;
+
+  // Retrigger: fade + stop any roar still playing so strikes stay punchy
+  // instead of stacking into a mush when whipping fast.
+  if (activeGuanzhang) {
+    const { src, gain } = activeGuanzhang;
+    try {
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(Math.max(gain.gain.value || 0.0001, 0.0001), now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
+      src.stop(now + 0.07);
+    } catch (e) {}
+    activeGuanzhang = null;
+  }
+
+  const src = ctx.createBufferSource();
+  src.buffer = guanzhang.buffer;
+  const gain = ctx.createGain();
+  const fade = 0.03;
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(1.0, now + fade);
+  gain.gain.setValueAtTime(1.0, now + Math.max(fade, lengthSec - 0.1));
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + lengthSec);
+  src.connect(gain);
+  gain.connect(ctx.destination);
+  src.start(now, offsetSec, lengthSec);
+
+  const mine = { src, gain };
+  activeGuanzhang = mine;
+  src.onended = () => { if (activeGuanzhang === mine) activeGuanzhang = null; };
+}
+
+function makeGrowlCurve(amount) {
+  const n = 2048;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = ((Math.PI + amount) * x) / (Math.PI + amount * Math.abs(x));
+  }
+  return curve;
+}
+
+// Aggressive throaty roar with a ~30Hz amplitude trill to fake the rolled "R".
+function synthGuanzhang() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const dur = 0.72;
+
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(0.9, now + 0.04);
+  master.gain.setValueAtTime(0.9, now + dur - 0.14);
+  master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  master.connect(ctx.destination);
+
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = makeGrowlCurve(55);
+  shaper.oversample = '4x';
+  shaper.connect(master);
+
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(750, now);
+  bp.frequency.linearRampToValueAtTime(1050, now + dur);
+  bp.Q.value = 1.1;
+  bp.connect(shaper);
+
+  const osc = ctx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(115, now);
+  osc.frequency.linearRampToValueAtTime(150, now + dur); // rising = more aggression
+
+  // Trill: fast square-wave AM chops the tone into an "RRRR" roll.
+  const trill = ctx.createGain();
+  trill.gain.value = 0.5;
+  const lfo = ctx.createOscillator();
+  lfo.type = 'square';
+  lfo.frequency.setValueAtTime(26, now);
+  lfo.frequency.linearRampToValueAtTime(34, now + dur);
+  const lfoGain = ctx.createGain();
+  lfoGain.gain.value = 0.5;
+  lfo.connect(lfoGain);
+  lfoGain.connect(trill.gain);
+
+  osc.connect(trill);
+  trill.connect(bp);
+
+  osc.start(now); lfo.start(now);
+  osc.stop(now + dur); lfo.stop(now + dur);
 }
 
 function updateHandleAim() {
@@ -294,6 +457,24 @@ function applyWallCollisions() {
   }
 }
 
+// Clamp every point to finite values within a generous bound around the
+// canvas. Recovers gracefully (snaps a runaway point back toward the handle)
+// so a coordinate explosion can never crash the renderer.
+function sanitizeWhip() {
+  if (!whip) return;
+  const hx = mouseX, hy = mouseY;
+  const loX = -W - 4000, hiX = 2 * W + 4000;
+  const loY = -H - 4000, hiY = 2 * H + 4000;
+  for (const p of whip) {
+    if (!Number.isFinite(p.x)) { p.x = hx; p.px = hx; }
+    if (!Number.isFinite(p.y)) { p.y = hy; p.py = hy; }
+    if (p.x < loX) { p.x = loX; p.px = loX; } else if (p.x > hiX) { p.x = hiX; p.px = hiX; }
+    if (p.y < loY) { p.y = loY; p.py = loY; } else if (p.y > hiY) { p.y = hiY; p.py = hiY; }
+    if (!Number.isFinite(p.px)) p.px = p.x;
+    if (!Number.isFinite(p.py)) p.py = p.y;
+  }
+}
+
 // ── Physics step ────────────────────────────────────────────────────────────
 function update() {
   if (!whip) return;
@@ -353,15 +534,22 @@ function update() {
     applyWallCollisions();
   }
 
+  // Safety net: never let non-finite/extreme coordinates reach the canvas.
+  // A fast cross-monitor cursor jump could otherwise spike the physics into
+  // NaN/huge values and crash the GPU compositor on a transparent window.
+  sanitizeWhip();
+
   // Tip velocity for crack detection
   const tip = whip[whip.length - 1];
-  const tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
+  let tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
+  if (!Number.isFinite(tipVel)) tipVel = 0;
 
   if (!dropping && tipVel > P.crackSpeed) {
     const now = Date.now();
     if (now - whipSpawnTime >= P.firstCrackGraceMs && now - lastCrackTime > P.crackCooldownMs) {
       lastCrackTime = now;
       playCrackSound();
+      playGuanzhang();
       window.bridge.whipCrack();
     }
   }
@@ -429,14 +617,18 @@ function draw() {
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 function loop() {
-  update();
-  draw();
+  // Guard the frame so a transient math error can never kill the animation.
+  try {
+    update();
+    draw();
+  } catch (e) { /* skip this frame */ }
   requestAnimationFrame(loop);
 }
 loop();
 
 // ── IPC from main process ───────────────────────────────────────────────────
 window.bridge.onSpawnWhip(() => {
+  ensureGuanzhang(); // start decoding so the roar is ready by the first crack
   whip = spawnWhip(mouseX || W / 2, mouseY || H / 2);
   dropping = false;
   prevMouseX = mouseX;
