@@ -32,6 +32,7 @@ let tray, overlay;
 let overlayReady = false;
 let spawnQueued = false;
 let macroBusy = false; // serialize interrupt+type so rapid cracks don't clobber each other
+let cursorTimer = null; // polls the OS cursor so the handle follows it without focus
 
 const VK_CONTROL = 0x11;
 const VK_RETURN  = 0x0D;
@@ -202,6 +203,7 @@ function createOverlay() {
     overlay = null;
     overlayReady = false;
     spawnQueued = false;
+    stopCursorTracking();
   });
 }
 
@@ -216,12 +218,39 @@ function toggleOverlay() {
   const b = virtualDesktopBounds();
   overlay.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
   overlay.show();
+  startCursorTracking();
   if (overlayReady) {
     overlay.webContents.send('spawn-whip');
     refocusPreviousApp();
   } else {
     spawnQueued = true;
   }
+}
+
+// Push the current cursor position (as window-local CSS px) to the renderer.
+// We poll the OS cursor instead of relying on DOM `mousemove`, because the
+// overlay is a non-focusable background window: once we Cmd+Tab focus back to
+// the user's app (so the crack macro can type there), macOS stops delivering
+// mousemove to the overlay and the handle would otherwise freeze in place.
+// getCursorScreenPoint() and getBounds() are both in DIP, matching the canvas'
+// CSS pixels, so the subtraction lands the handle exactly under the cursor.
+function sendCursor() {
+  if (!overlay || overlay.isDestroyed() || !overlay.isVisible()) return;
+  try {
+    const b = overlay.getBounds();
+    const c = screen.getCursorScreenPoint();
+    overlay.webContents.send('cursor', { x: c.x - b.x, y: c.y - b.y });
+  } catch (e) {}
+}
+
+function startCursorTracking() {
+  stopCursorTracking();
+  sendCursor(); // seed immediately so the first spawn lands under the cursor
+  cursorTimer = setInterval(sendCursor, 16); // ~60 Hz
+}
+
+function stopCursorTracking() {
+  if (cursorTimer) { clearInterval(cursorTimer); cursorTimer = null; }
 }
 
 // ── IPC ─────────────────────────────────────────────────────────────────────

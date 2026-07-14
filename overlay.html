@@ -106,6 +106,10 @@ function getAudioCtx() {
   return audioCtx;
 }
 
+// Primary cursor source: the main process polls the OS cursor and pushes it
+// here (works even when the overlay isn't the focused window). DOM mousemove is
+// kept only as a fallback for when the overlay does happen to have focus.
+window.bridge.onCursor(pos => { mouseX = pos.x; mouseY = pos.y; });
 document.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 document.addEventListener('mousedown', () => {
   ensureGuanzhang(); // unlock audio + kick off decode
