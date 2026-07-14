@@ -107,6 +107,11 @@ async function getTrayIcon() {
     return createTrayIconFallback();
   }
   if (process.platform === 'darwin') {
+    // The menu bar wants a monochrome template image (adapts to light/dark),
+    // not a colored app-icon thumbnail. Prefer Template.png.
+    const tmpl = createTrayIconFallback();
+    if (!tmpl.isEmpty()) return tmpl;
+    // Fallback to the .icns only if Template.png is missing.
     const file = path.join(iconDir, 'AppIcon.icns');
     if (fs.existsSync(file)) {
       const fromPath = nativeImage.createFromPath(file);
@@ -126,7 +131,7 @@ async function getTrayIcon() {
         console.warn('AppIcon.icns temp copy + thumbnail failed:', e?.message || e);
       }
     }
-    return createTrayIconFallback();
+    return nativeImage.createEmpty();
   }
   return createTrayIconFallback();
 }
