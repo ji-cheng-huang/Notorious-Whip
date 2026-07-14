@@ -23,7 +23,7 @@ const P = {
   // Physics
   gravity:        1.2,   // normal gravity
   dropGravity:    0.95,    // gravity when dropping/despawning
-  damping:        0.96,  // velocity retention per frame (1 = no loss)
+  damping:        0.985,  // velocity retention per frame (1 = no loss)
   constraintIters:20,     // higher = stiffer chain
   maxStretchRatio: 1.2,  // hard cap for per-link stretch during fast whips
 
@@ -32,7 +32,7 @@ const P = {
   handleAimByMouseX: 0.4, // horizontal mouse movement influence on target angle
   handleAimByMouseY: 0.2, // vertical mouse movement influence on target angle
   handleAimClamp:    2.0,  // max radians target can deviate from base angle
-  handleSpring:      0.7,  // restoring force to target angle
+  handleSpring:      0.9,  // restoring force to target angle
   handleAngularDamping: 0.078, // angular velocity damping
   basePoseSegments: 2,    // how many early segments are strongly guided
   basePoseStiffStart: 0.9, // stiffness near handle
@@ -49,9 +49,9 @@ const P = {
   wallFriction:    0.86,   // tangential damping on wall hit
 
   // Crack detection
-  crackSpeed:     340,     // tip velocity threshold to trigger crack
-  crackCooldownMs:200,   // min ms between cracks
-  firstCrackGraceMs: 350, // no crack (macro) until this long after spawn
+  crackSpeed:     260,     // tip velocity threshold to trigger crack
+  crackCooldownMs:120,   // min ms between cracks
+  firstCrackGraceMs: 150, // no crack (macro) until this long after spawn
 
   // Visuals
   lineWidthHandle: 7,      // rope thickness near handle
