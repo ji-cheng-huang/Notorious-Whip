@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -13,6 +13,7 @@ if (!app.requestSingleInstanceLock()) {
   return;
 }
 app.on('second-instance', () => { try { toggleOverlay(); } catch (e) {} });
+app.on('before-quit', () => { try { globalShortcut.unregisterAll(); } catch (e) {} });
 
 // ── Win32 FFI (Windows only) ────────────────────────────────────────────────
 let keybd_event, VkKeyScanA;
@@ -204,6 +205,7 @@ function createOverlay() {
     overlayReady = false;
     spawnQueued = false;
     stopCursorTracking();
+    unregisterEscapeHatch();
   });
 }
 
@@ -218,6 +220,13 @@ function toggleOverlay() {
   const b = virtualDesktopBounds();
   overlay.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
   overlay.show();
+  // The overlay is a full-screen, input-capturing, screen-saver-level window
+  // that even sits above the menu bar — so while it's up, the tray icon is
+  // unreachable. If transparency/compositing ever fails (common on single
+  // integrated-GPU displays) it covers everything opaque with no way out.
+  // Escape is a guaranteed keyboard escape hatch, live only while visible so
+  // it never steals Escape from other apps the rest of the time.
+  registerEscapeHatch();
   startCursorTracking();
   if (overlayReady) {
     overlay.webContents.send('spawn-whip');
@@ -225,6 +234,31 @@ function toggleOverlay() {
   } else {
     spawnQueued = true;
   }
+}
+
+/** Force-hide the overlay immediately (no drop animation) and drop the Escape
+ *  hatch. Safe to call from any path — click-drop, IPC, or the panic key. */
+function hideOverlayNow() {
+  try { if (overlay) overlay.hide(); } catch (e) {}
+  spawnQueued = false;
+  stopCursorTracking();
+  unregisterEscapeHatch();
+}
+
+function registerEscapeHatch() {
+  try {
+    if (!globalShortcut.isRegistered('Escape')) {
+      globalShortcut.register('Escape', hideOverlayNow);
+    }
+  } catch (e) {
+    console.warn('could not register Escape hatch:', e?.message || e);
+  }
+}
+
+function unregisterEscapeHatch() {
+  try {
+    if (globalShortcut.isRegistered('Escape')) globalShortcut.unregister('Escape');
+  } catch (e) {}
 }
 
 // Push the current cursor position (as window-local CSS px) to the renderer.
@@ -261,7 +295,7 @@ ipcMain.on('whip-crack', () => {
     console.warn('sendMacro failed:', err?.message || err);
   }
 });
-ipcMain.on('hide-overlay', () => { if (overlay) overlay.hide(); });
+ipcMain.on('hide-overlay', () => hideOverlayNow());
 // Read a bundled sound file for the sandboxed renderer (Web Audio decode).
 // basename() blocks path escapes; returns null if the file is missing.
 ipcMain.handle('read-sound', (_e, name) => {

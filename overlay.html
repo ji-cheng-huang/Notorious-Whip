@@ -113,7 +113,14 @@ window.bridge.onCursor(pos => { mouseX = pos.x; mouseY = pos.y; });
 document.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 document.addEventListener('mousedown', () => {
   ensureGuanzhang(); // unlock audio + kick off decode
-  if (whip && !dropping) dropping = true;
+  if (whip) {
+    if (!dropping) dropping = true; // click = drop the whip (animates off-screen)
+  } else {
+    // No whip to drop — never leave a click as a no-op on this full-screen,
+    // input-capturing window, or the overlay would swallow clicks with no way
+    // out. Bail immediately.
+    window.bridge.hideOverlay();
+  }
 });
 
 // ── Whip creation ───────────────────────────────────────────────────────────
