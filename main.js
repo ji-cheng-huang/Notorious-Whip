@@ -77,8 +77,11 @@ function refocusPreviousApp() {
 function createTrayIconFallback() {
   const p = path.join(__dirname, 'icon', 'Template.png');
   if (fs.existsSync(p)) {
-    const img = nativeImage.createFromPath(p);
+    let img = nativeImage.createFromPath(p);
     if (!img.isEmpty()) {
+      // Tray/menu-bar icons must be small (~16-22px). A full 512px image can
+      // render blank or oversized in the macOS menu bar, so scale it down.
+      img = img.resize({ width: 22, height: 22, quality: 'best' });
       if (process.platform === 'darwin') img.setTemplateImage(true);
       return img;
     }
@@ -361,13 +364,31 @@ app.whenReady().then(async () => {
   if (process.platform === 'darwin' && app.dock) app.dock.hide();
 
   tray = new Tray(await getTrayIcon());
-  tray.setToolTip('OpenWhip - click for whip');
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Quit', click: () => app.quit() },
-    ])
-  );
+  tray.setToolTip('OpenWhip — left-click to crack the whip, right-click for menu');
+
+  // A short label next to the icon so people can actually find it in a crowded
+  // menu bar (the whip glyph alone is a thin monochrome line that's easy to
+  // miss, or gets tucked behind the notch).
+  if (process.platform === 'darwin') tray.setTitle(' Whip');
+
+  // Menu offers an explicit "Crack the whip" so the action is discoverable even
+  // if someone only ever opens the menu.
+  const menu = Menu.buildFromTemplate([
+    { label: 'Crack the whip 🔥', click: toggleOverlay },
+    { type: 'separator' },
+    { label: 'Quit', click: () => app.quit() },
+  ]);
+
+  // macOS/Windows: keep left-click free for the whip and show the menu only on
+  // right-click. Assigning a context menu via setContextMenu() hijacks the
+  // left-click to open the menu on macOS, which hides the whip action entirely.
+  if (process.platform === 'linux') {
+    // Many Linux tray backends (AppIndicator) don't emit click events at all —
+    // the context menu is the only reliable interaction, so bind it there.
+    tray.setContextMenu(menu);
+  }
   tray.on('click', toggleOverlay);
+  tray.on('right-click', () => tray.popUpContextMenu(menu));
 });
 
 app.on('window-all-closed', e => e.preventDefault()); // keep alive in tray
