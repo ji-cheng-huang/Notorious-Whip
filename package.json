@@ -1,5 +1,6 @@
 {
   "name": "openwhip",
+  "productName": "Notorious Whip",
   "version": "1.1.0",
   "description": "Whip Claude into shape",
   "license": "MIT",

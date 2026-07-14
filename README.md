@@ -1,4 +1,4 @@
-# OpenWhip
+# Notorious Whip
 
 ![Whip divider](assets/divider.png)
 

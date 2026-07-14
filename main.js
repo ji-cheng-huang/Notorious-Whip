@@ -112,8 +112,16 @@ async function getTrayIcon() {
     return createTrayIconFallback();
   }
   if (process.platform === 'darwin') {
-    // The menu bar wants a monochrome template image (adapts to light/dark),
-    // not a colored app-icon thumbnail. Prefer Template.png.
+    // Colored menu-bar icon (the 館長 + whip design). Kept as a normal (non-
+    // template) image so it shows in full color; createFromPath auto-loads the
+    // TrayColor@2x.png sibling for Retina. It won't adapt to light/dark, which
+    // is the trade-off for a colored tray icon.
+    const colored = path.join(iconDir, 'TrayColor.png');
+    if (fs.existsSync(colored)) {
+      const img = nativeImage.createFromPath(colored);
+      if (!img.isEmpty()) return img;
+    }
+    // Fall back to the monochrome whip template if the colored icon is missing.
     const tmpl = createTrayIconFallback();
     if (!tmpl.isEmpty()) return tmpl;
     // Fallback to the .icns only if Template.png is missing.
@@ -422,17 +430,17 @@ function sendMacroLinux(text, done = () => {}) {
 // ── App lifecycle ───────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
   // Tray-only utility: hide from the Dock and run as an accessory app. This
-  // also stops activating OpenWhip from kicking a fullscreen app out of its
+  // also stops activating Notorious Whip from kicking a fullscreen app out of its
   // Space when the overlay appears.
   if (process.platform === 'darwin' && app.dock) app.dock.hide();
 
   tray = new Tray(await getTrayIcon());
-  tray.setToolTip('OpenWhip — left-click to crack the whip, right-click for menu');
+  tray.setToolTip('Notorious Whip — left-click to crack the whip, right-click for menu');
 
   // A short label next to the icon so people can actually find it in a crowded
   // menu bar (the whip glyph alone is a thin monochrome line that's easy to
   // miss, or gets tucked behind the notch).
-  if (process.platform === 'darwin') tray.setTitle(' Whip');
+  if (process.platform === 'darwin') tray.setTitle(' Notorious Whip');
 
   // Menu offers an explicit "Crack the whip" so the action is discoverable even
   // if someone only ever opens the menu.
