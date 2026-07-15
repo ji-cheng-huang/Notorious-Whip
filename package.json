@@ -44,10 +44,34 @@
   "scripts": {
     "start": "node bin/openwhip.js",
     "dev": "electron .",
-    "pack": "npm pack"
+    "pack": "npm pack",
+    "dist": "electron-builder --mac dmg"
+  },
+  "build": {
+    "appId": "com.jicheng.notoriouswhip",
+    "productName": "Notorious Whip",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "overlay.html",
+      "sounds/**",
+      "icon/**"
+    ],
+    "mac": {
+      "target": "dmg",
+      "icon": "icon/AppIcon.icns",
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    }
   },
   "dependencies": {
-    "electron": "^33.0.0",
     "koffi": "^2.9.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
   }
 }
