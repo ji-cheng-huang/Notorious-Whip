@@ -9,17 +9,41 @@ whip appears, following your cursor across every screen. Crack it near Claude an
 fires an interrupt (Ctrl-C) plus a motivational phrase — layered with a whip crack and
 the **RRRRRRR** roar. Now with swappable whip materials. 😩💢
 
-## Install + run
+## Install
+
+### macOS (download the app)
+
+Grab the latest `.dmg` from
+**[Releases](https://github.com/ji-cheng-huang/Notorious-Whip/releases/latest)**, open it,
+and drag **Notorious Whip** into Applications. Then look for the whip icon (labelled
+**Notorious Whip**) up in your menu bar.
+
+It isn't code-signed yet, so on first launch macOS will block it. Open it once via
+**System Settings → Privacy & Security → Open Anyway** (or right-click the app → Open) — or
+clear the quarantine flag from the terminal:
 
 ```bash
-npm install -g openwhip
-openwhip
+xattr -dr com.apple.quarantine "/Applications/Notorious Whip.app"
 ```
 
-Look for the whip icon (labelled **Notorious Whip**) in your menu bar / system tray.
+The first time you crack the whip, grant **Accessibility** permission
+(System Settings → Privacy & Security → Accessibility) so it can send Ctrl-C and type.
 
-Windows and macOS work out of the box. Linux is a special snowflake — install `xdotool`
-for the keyboard automation:
+> Currently an Apple Silicon (arm64) build — Intel / Universal to follow.
+
+### Run from source (any platform)
+
+For development, Windows, or Linux, run it straight from the repo:
+
+```bash
+git clone https://github.com/ji-cheng-huang/Notorious-Whip.git
+cd Notorious-Whip
+npm install
+npm start
+```
+
+Build your own macOS `.dmg` with `npm run dist`. Linux also needs `xdotool` for the
+keyboard automation:
 
 ```bash
 sudo apt install xdotool
