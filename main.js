@@ -34,6 +34,18 @@ let overlayReady = false;
 let spawnQueued = false;
 let macroBusy = false; // serialize interrupt+type so rapid cracks don't clobber each other
 let cursorTimer = null; // polls the OS cursor so the handle follows it without focus
+let trayMenu = null;
+let currentSkin = 'classic';
+// Whip skins the user can pick from the tray. The visual details live in the
+// renderer (overlay.html SKINS); here we only need the id + menu label. To add
+// a skin, add it in both places using the same id.
+const SKINS = [
+  { id: 'classic',   label: 'Classic — black & white' },
+  { id: 'notorious', label: 'Notorious — braided leather + red glow' },
+  { id: 'chrome',    label: 'Chrome — polished metal' },
+  { id: 'gold',      label: 'Gold' },
+  { id: 'neon',      label: 'Neon — cyan' },
+];
 
 const VK_CONTROL = 0x11;
 const VK_RETURN  = 0x0D;
@@ -202,6 +214,7 @@ function createOverlay() {
   overlay.loadFile('overlay.html');
   overlay.webContents.on('did-finish-load', () => {
     overlayReady = true;
+    overlay.webContents.send('set-skin', currentSkin); // apply the saved skin
     if (spawnQueued && overlay && overlay.isVisible()) {
       spawnQueued = false;
       overlay.webContents.send('spawn-whip');
@@ -293,6 +306,51 @@ function startCursorTracking() {
 
 function stopCursorTracking() {
   if (cursorTimer) { clearInterval(cursorTimer); cursorTimer = null; }
+}
+
+// ── Skins & persistence ─────────────────────────────────────────────────────
+function configPath() { return path.join(app.getPath('userData'), 'config.json'); }
+
+function loadConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    if (c && typeof c.skin === 'string' && SKINS.some(s => s.id === c.skin)) currentSkin = c.skin;
+  } catch (e) { /* no/invalid config: keep default */ }
+}
+
+function saveConfig() {
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(configPath(), JSON.stringify({ skin: currentSkin }, null, 2));
+  } catch (e) {
+    console.warn('could not save config:', e?.message || e);
+  }
+}
+
+function setSkin(id) {
+  if (!SKINS.some(s => s.id === id)) return;
+  currentSkin = id;
+  saveConfig();
+  if (overlay && !overlay.isDestroyed()) overlay.webContents.send('set-skin', id);
+  rebuildTrayMenu(); // refresh the radio checkmark
+}
+
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: 'Crack the whip 🔥', click: toggleOverlay },
+    { label: 'Skin', submenu: SKINS.map(s => ({
+        label: s.label, type: 'radio', checked: currentSkin === s.id, click: () => setSkin(s.id),
+      })) },
+    { type: 'separator' },
+    { label: 'Quit', click: () => app.quit() },
+  ]);
+}
+
+function rebuildTrayMenu() {
+  trayMenu = buildTrayMenu();
+  // Linux tray backends generally need a context menu bound; on macOS/Windows we
+  // keep left-click free for the whip and pop this up on right-click instead.
+  if (process.platform === 'linux' && tray) tray.setContextMenu(trayMenu);
 }
 
 // ── IPC ─────────────────────────────────────────────────────────────────────
@@ -442,24 +500,16 @@ app.whenReady().then(async () => {
   // miss, or gets tucked behind the notch).
   if (process.platform === 'darwin') tray.setTitle(' Notorious Whip');
 
-  // Menu offers an explicit "Crack the whip" so the action is discoverable even
-  // if someone only ever opens the menu.
-  const menu = Menu.buildFromTemplate([
-    { label: 'Crack the whip 🔥', click: toggleOverlay },
-    { type: 'separator' },
-    { label: 'Quit', click: () => app.quit() },
-  ]);
+  // Menu offers an explicit "Crack the whip" plus a "Skin" picker. Built after
+  // loading the saved skin so the right radio item starts checked.
+  loadConfig();
+  rebuildTrayMenu();
 
-  // macOS/Windows: keep left-click free for the whip and show the menu only on
-  // right-click. Assigning a context menu via setContextMenu() hijacks the
-  // left-click to open the menu on macOS, which hides the whip action entirely.
-  if (process.platform === 'linux') {
-    // Many Linux tray backends (AppIndicator) don't emit click events at all —
-    // the context menu is the only reliable interaction, so bind it there.
-    tray.setContextMenu(menu);
-  }
+  // macOS/Windows: keep left-click free for the whip and pop the menu on
+  // right-click (setContextMenu would hijack the left-click on macOS). Linux
+  // already got the context menu bound in rebuildTrayMenu().
   tray.on('click', toggleOverlay);
-  tray.on('right-click', () => tray.popUpContextMenu(menu));
+  tray.on('right-click', () => tray.popUpContextMenu(trayMenu));
 });
 
 app.on('window-all-closed', e => e.preventDefault()); // keep alive in tray

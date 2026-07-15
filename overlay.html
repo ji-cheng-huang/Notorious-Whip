@@ -85,6 +85,34 @@ let whipSpawnTime = 0;
 let handleAngle = P.baseTargetAngle;
 let handleAngVel = 0;
 
+// Whip materials — visuals only (physics unchanged). The tray "Skin" menu (main
+// process) persists the choice and pushes the id here via `set-skin`.
+//   type 'flat' → coloured halo + solid core (the original look)
+//   type 'tube' → each segment shaded across its width (shadow→highlight→mid),
+//                 with a dark `edge`, optional `braid` cross-hatch, and glowing
+//                 `seam` dots. That's what gives real material instead of a
+//                 single flat colour.
+// Add your own by adding an entry here AND in SKINS in main.js (same id).
+const SKINS = {
+  classic:   { type: 'flat', core: '#111111', outline: '#ffffff', glow: null },
+  notorious: { type: 'tube', edge: '#050505',
+               shadow: '#160a05', mid: '#3c1d10', highlight: '#8a4526',   // braided leather
+               glow: { color: '#ff2a2a', blur: 8 },
+               braid: { color: '#000000', alpha: 0.55 },
+               seam:  { color: '#ff3b2f', blur: 16, spacing: 4, size: 2.6 } },
+  chrome:    { type: 'tube', edge: '#0a0f14',
+               shadow: '#28323d', mid: '#93a2af', highlight: '#ffffff',    // polished metal
+               glow: null, braid: null, seam: null },
+  gold:      { type: 'tube', edge: '#2e1f00',
+               shadow: '#5a3d00', mid: '#caa02a', highlight: '#fff3b8',
+               glow: { color: '#ffb300', blur: 8 }, braid: null,
+               seam:  { color: '#ffd257', blur: 12, spacing: 5, size: 2 } },
+  neon:      { type: 'tube', edge: '#031a20',
+               shadow: '#053a46', mid: '#19c9e2', highlight: '#eaffff',
+               glow: { color: '#00e0ff', blur: 20 }, braid: null, seam: null },
+};
+let skin = SKINS.classic;
+
 const WHIP_CRACK_SOUNDS = ['sounds/A.mp3', 'sounds/B.mp3', 'sounds/C.mp3', 'sounds/D.mp3', 'sounds/E.mp3'];
 
 // 館長 roar. If a recording exists at sounds/guanzhang.mp3 we decode it once,
@@ -578,6 +606,8 @@ function update() {
 // ── Rendering ───────────────────────────────────────────────────────────────
 function draw() {
   ctx.clearRect(0, 0, W, H);
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
 
   // Near-invisible fill so the window captures mouse events on Windows
   ctx.fillStyle = `rgba(0,0,0,${P.bgAlpha})`;
@@ -585,10 +615,29 @@ function draw() {
 
   if (!whip) return;
 
-  // White: thin halo on full spline, then extra thickness only over handle links.
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.strokeStyle = '#fff';
+  if (skin.type === 'tube') drawTubeWhip(); else drawFlatWhip();
+}
+
+// Segment width at index i (the handle→tip taper used across the renderer).
+function segWidth(i) {
+  const t = i / Math.max(1, whip.length - 2);
+  const extra = i < P.handleThickSegments ? P.handleExtraWidth : 0;
+  return lerp(P.lineWidthHandle, P.lineWidthTip, t) + extra;
+}
+
+function bezierSeg(i) {
+  const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+  ctx.beginPath();
+  ctx.moveTo(whip[i].x, whip[i].y);
+  ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+}
+
+// Original flat look: coloured halo/outline + solid core (optional glow).
+function drawFlatWhip() {
+  if (skin.glow) { ctx.shadowColor = skin.glow.color; ctx.shadowBlur = skin.glow.blur; }
+  ctx.strokeStyle = skin.outline;
   if (whip.length >= 2) {
     ctx.beginPath();
     ctx.moveTo(whip[0].x, whip[0].y);
@@ -598,7 +647,6 @@ function draw() {
     }
     ctx.lineWidth = P.lineWidthTip + P.outlineWidth * 2;
     ctx.stroke();
-
     const thickLinks = Math.min(P.handleThickSegments, whip.length - 1);
     if (thickLinks > 0 && P.handleExtraWidth > 0) {
       ctx.beginPath();
@@ -607,22 +655,88 @@ function draw() {
         const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
         ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
       }
-      ctx.lineWidth =
-        P.lineWidthHandle + P.handleExtraWidth + P.outlineWidth * 2;
+      ctx.lineWidth = P.lineWidthHandle + P.handleExtraWidth + P.outlineWidth * 2;
       ctx.stroke();
     }
   }
-
-  ctx.strokeStyle = '#111';
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = skin.core;
   for (let i = 0; i < whip.length - 1; i++) {
-    const t = i / Math.max(1, whip.length - 2);
-    const extra = i < P.handleThickSegments ? P.handleExtraWidth : 0;
-    ctx.lineWidth = lerp(P.lineWidthHandle, P.lineWidthTip, t) + extra;
-    const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
-    ctx.beginPath();
-    ctx.moveTo(whip[i].x, whip[i].y);
-    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+    ctx.lineWidth = segWidth(i);
+    bezierSeg(i);
     ctx.stroke();
+  }
+}
+
+// Material look: each segment is a shaded tube (shadow→highlight→mid across its
+// width) with a dark edge, optional braid cross-hatch, and glowing seam dots.
+function drawTubeWhip() {
+  // overall aura for glowing materials
+  if (skin.glow) {
+    ctx.save();
+    ctx.shadowColor = skin.glow.color; ctx.shadowBlur = skin.glow.blur;
+    ctx.strokeStyle = skin.glow.color; ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(whip[0].x, whip[0].y);
+    for (let i = 0; i < whip.length - 1; i++) {
+      const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+    }
+    ctx.lineWidth = P.lineWidthTip;
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0;
+
+  for (let i = 0; i < whip.length - 1; i++) {
+    const a = whip[i], b = whip[i + 1];
+    const w = segWidth(i);
+    // dark edge for definition
+    if (skin.edge) {
+      ctx.strokeStyle = skin.edge;
+      ctx.lineWidth = w + 2.5;
+      bezierSeg(i); ctx.stroke();
+    }
+    // shaded tube: linear gradient across the segment's width
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const pxu = -dy / len, pyu = dx / len;
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, hw = w / 2;
+    const grad = ctx.createLinearGradient(mx - pxu * hw, my - pyu * hw, mx + pxu * hw, my + pyu * hw);
+    grad.addColorStop(0.0, skin.shadow);
+    grad.addColorStop(0.34, skin.highlight);
+    grad.addColorStop(0.58, skin.mid);
+    grad.addColorStop(1.0, skin.shadow);
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = w;
+    bezierSeg(i); ctx.stroke();
+    // braid cross-hatch: short diagonal tick, alternating direction per segment
+    if (skin.braid) {
+      const ta = Math.atan2(dy, dx) + (i % 2 ? 0.7 : -0.7);
+      const L = w * 0.85;
+      ctx.strokeStyle = skin.braid.color;
+      ctx.globalAlpha = skin.braid.alpha;
+      ctx.lineWidth = Math.max(1.5, w * 0.16);
+      ctx.beginPath();
+      ctx.moveTo(mx - Math.cos(ta) * L, my - Math.sin(ta) * L);
+      ctx.lineTo(mx + Math.cos(ta) * L, my + Math.sin(ta) * L);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // glowing seam dots spaced along the rope
+  if (skin.seam) {
+    ctx.save();
+    ctx.shadowColor = skin.seam.color; ctx.shadowBlur = skin.seam.blur;
+    ctx.fillStyle = skin.seam.color;
+    for (let i = 1; i < whip.length - 1; i += skin.seam.spacing) {
+      ctx.beginPath();
+      ctx.arc(whip[i].x, whip[i].y, skin.seam.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 }
 
@@ -638,6 +752,8 @@ function loop() {
 loop();
 
 // ── IPC from main process ───────────────────────────────────────────────────
+window.bridge.onSetSkin(id => { skin = SKINS[id] || SKINS.classic; });
+
 window.bridge.onSpawnWhip(() => {
   ensureGuanzhang(); // start decoding so the roar is ready by the first crack
   whip = spawnWhip(mouseX || W / 2, mouseY || H / 2);
