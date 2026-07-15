@@ -1,5 +1,6 @@
 {
   "name": "openwhip",
+  "productName": "Notorious Whip",
   "version": "1.1.0",
   "description": "Whip Claude into shape",
   "license": "MIT",
@@ -41,7 +42,7 @@
     "README.md"
   ],
   "scripts": {
-    "start": "electron .",
+    "start": "node bin/openwhip.js",
     "dev": "electron .",
     "pack": "npm pack"
   },

@@ -23,7 +23,7 @@ const P = {
   // Physics
   gravity:        1.2,   // normal gravity
   dropGravity:    0.95,    // gravity when dropping/despawning
-  damping:        0.96,  // velocity retention per frame (1 = no loss)
+  damping:        0.985,  // velocity retention per frame (1 = no loss)
   constraintIters:20,     // higher = stiffer chain
   maxStretchRatio: 1.2,  // hard cap for per-link stretch during fast whips
 
@@ -32,7 +32,7 @@ const P = {
   handleAimByMouseX: 0.4, // horizontal mouse movement influence on target angle
   handleAimByMouseY: 0.2, // vertical mouse movement influence on target angle
   handleAimClamp:    2.0,  // max radians target can deviate from base angle
-  handleSpring:      0.7,  // restoring force to target angle
+  handleSpring:      0.9,  // restoring force to target angle
   handleAngularDamping: 0.078, // angular velocity damping
   basePoseSegments: 2,    // how many early segments are strongly guided
   basePoseStiffStart: 0.9, // stiffness near handle
@@ -49,9 +49,9 @@ const P = {
   wallFriction:    0.86,   // tangential damping on wall hit
 
   // Crack detection
-  crackSpeed:     340,     // tip velocity threshold to trigger crack
-  crackCooldownMs:200,   // min ms between cracks
-  firstCrackGraceMs: 350, // no crack (macro) until this long after spawn
+  crackSpeed:     260,     // tip velocity threshold to trigger crack
+  crackCooldownMs:120,   // min ms between cracks
+  firstCrackGraceMs: 150, // no crack (macro) until this long after spawn
 
   // Visuals
   lineWidthHandle: 7,      // rope thickness near handle
@@ -85,11 +85,70 @@ let whipSpawnTime = 0;
 let handleAngle = P.baseTargetAngle;
 let handleAngVel = 0;
 
+// Whip materials — visuals only (physics unchanged). The tray "Skin" menu (main
+// process) persists the choice and pushes the id here via `set-skin`.
+//   type 'flat' → coloured halo + solid core (the original look)
+//   type 'tube' → each segment shaded across its width (shadow→highlight→mid),
+//                 with a dark `edge`, optional `braid` cross-hatch, and glowing
+//                 `seam` dots. That's what gives real material instead of a
+//                 single flat colour.
+// Add your own by adding an entry here AND in SKINS in main.js (same id).
+const SKINS = {
+  classic:   { type: 'flat', core: '#111111', outline: '#ffffff', glow: null },
+  notorious: { type: 'tube', edge: '#050505',
+               shadow: '#160a05', mid: '#3c1d10', highlight: '#8a4526',   // braided leather
+               glow: { color: '#ff2a2a', blur: 8 },
+               braid: { color: '#000000', alpha: 0.55 },
+               seam:  { color: '#ff3b2f', blur: 16, spacing: 4, size: 2.6 } },
+  chrome:    { type: 'tube', edge: '#0a0f14',
+               shadow: '#28323d', mid: '#93a2af', highlight: '#ffffff',    // polished metal
+               glow: null, braid: null, seam: null },
+  gold:      { type: 'tube', edge: '#2e1f00',
+               shadow: '#5a3d00', mid: '#caa02a', highlight: '#fff3b8',
+               glow: { color: '#ffb300', blur: 8 }, braid: null,
+               seam:  { color: '#ffd257', blur: 12, spacing: 5, size: 2 } },
+  neon:      { type: 'tube', edge: '#031a20',
+               shadow: '#053a46', mid: '#19c9e2', highlight: '#eaffff',
+               glow: { color: '#00e0ff', blur: 20 }, braid: null, seam: null },
+};
+let skin = SKINS.classic;
+
 const WHIP_CRACK_SOUNDS = ['sounds/A.mp3', 'sounds/B.mp3', 'sounds/C.mp3', 'sounds/D.mp3', 'sounds/E.mp3'];
 
+// 館長 roar. If a recording exists at sounds/guanzhang.mp3 we decode it once,
+// then each strike plays only the loudest ~window-sec slice (auto-trim) with
+// fades, retriggering so rapid whips don't pile up. No file / decode failure
+// falls back to the synthesized growl below.
+const GUANZHANG_FILE = 'guanzhang.mp3';
+const GUANZHANG_WINDOW_SEC = 1.1; // how much of the clip each strike plays
+const guanzhang = { state: 'idle', buffer: null, window: null }; // idle|loading|ready|none
+let activeGuanzhang = null; // currently-playing source, for retrigger
+
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) audioCtx = new AC();
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+
+// Primary cursor source: the main process polls the OS cursor and pushes it
+// here (works even when the overlay isn't the focused window). DOM mousemove is
+// kept only as a fallback for when the overlay does happen to have focus.
+window.bridge.onCursor(pos => { mouseX = pos.x; mouseY = pos.y; });
 document.addEventListener('mousemove', e => { mouseX = e.clientX; mouseY = e.clientY; });
 document.addEventListener('mousedown', () => {
-  if (whip && !dropping) dropping = true;
+  ensureGuanzhang(); // unlock audio + kick off decode
+  if (whip) {
+    if (!dropping) dropping = true; // click = drop the whip (animates off-screen)
+  } else {
+    // No whip to drop — never leave a click as a no-op on this full-screen,
+    // input-capturing window, or the overlay would swallow clicks with no way
+    // out. Bail immediately.
+    window.bridge.hideOverlay();
+  }
 });
 
 // ── Whip creation ───────────────────────────────────────────────────────────
@@ -165,6 +224,149 @@ function playCrackSound() {
   const src = WHIP_CRACK_SOUNDS[Math.floor(Math.random() * WHIP_CRACK_SOUNDS.length)];
   const a = new Audio(src);
   a.play().catch(() => {});
+}
+
+// Decode the 館長 file once and find its punchiest window. Safe to call often;
+// only the first call does work. Runs off a user gesture / whip spawn so audio
+// is ready by the first crack.
+function ensureGuanzhang() {
+  if (guanzhang.state !== 'idle') return;
+  const ctx = getAudioCtx();
+  const read = window.bridge && window.bridge.readSound;
+  if (!ctx || !read) { guanzhang.state = 'none'; return; }
+  guanzhang.state = 'loading';
+  // readSound resolves to a Uint8Array (Buffer over IPC); decodeAudioData wants
+  // a standalone ArrayBuffer, so copy out the exact byte range.
+  Promise.resolve()
+    .then(() => read(GUANZHANG_FILE))
+    .then(bytes => {
+      if (!bytes || !bytes.byteLength) { guanzhang.state = 'none'; return; }
+      const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return ctx.decodeAudioData(ab).then(buf => {
+        guanzhang.buffer = buf;
+        guanzhang.window = loudestWindow(buf, GUANZHANG_WINDOW_SEC);
+        guanzhang.state = 'ready';
+      });
+    })
+    .catch(() => { guanzhang.state = 'none'; });
+}
+
+// Slide a fixed-length window across the clip and return the highest-energy
+// (loudest) one — that's the RRRR we want, wherever it sits in the file.
+function loudestWindow(buf, maxSec) {
+  const sr = buf.sampleRate;
+  const data = buf.getChannelData(0);
+  const n = data.length;
+  const winLen = Math.min(Math.max(1, Math.floor(maxSec * sr)), n);
+  const step = Math.max(1, Math.floor(sr * 0.02)); // 20ms hops
+  let sum = 0;
+  for (let i = 0; i < winLen; i++) sum += data[i] * data[i];
+  let bestStart = 0, bestSum = sum;
+  for (let start = step; start + winLen <= n; start += step) {
+    for (let i = start - step; i < start; i++) sum -= data[i] * data[i];
+    for (let i = start - step + winLen; i < start + winLen; i++) sum += data[i] * data[i];
+    if (sum > bestSum) { bestSum = sum; bestStart = start; }
+  }
+  return { offsetSec: bestStart / sr, lengthSec: winLen / sr };
+}
+
+// 館長 RRRRRRR — plays on every whip strike, layered over the crack.
+function playGuanzhang() {
+  ensureGuanzhang();
+  if (guanzhang.state !== 'ready') return synthGuanzhang();
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const { offsetSec, lengthSec } = guanzhang.window;
+
+  // Retrigger: fade + stop any roar still playing so strikes stay punchy
+  // instead of stacking into a mush when whipping fast.
+  if (activeGuanzhang) {
+    const { src, gain } = activeGuanzhang;
+    try {
+      gain.gain.cancelScheduledValues(now);
+      gain.gain.setValueAtTime(Math.max(gain.gain.value || 0.0001, 0.0001), now);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.05);
+      src.stop(now + 0.07);
+    } catch (e) {}
+    activeGuanzhang = null;
+  }
+
+  const src = ctx.createBufferSource();
+  src.buffer = guanzhang.buffer;
+  const gain = ctx.createGain();
+  const fade = 0.03;
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(1.0, now + fade);
+  gain.gain.setValueAtTime(1.0, now + Math.max(fade, lengthSec - 0.1));
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + lengthSec);
+  src.connect(gain);
+  gain.connect(ctx.destination);
+  src.start(now, offsetSec, lengthSec);
+
+  const mine = { src, gain };
+  activeGuanzhang = mine;
+  src.onended = () => { if (activeGuanzhang === mine) activeGuanzhang = null; };
+}
+
+function makeGrowlCurve(amount) {
+  const n = 2048;
+  const curve = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i * 2) / n - 1;
+    curve[i] = ((Math.PI + amount) * x) / (Math.PI + amount * Math.abs(x));
+  }
+  return curve;
+}
+
+// Aggressive throaty roar with a ~30Hz amplitude trill to fake the rolled "R".
+function synthGuanzhang() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const dur = 0.72;
+
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(0.9, now + 0.04);
+  master.gain.setValueAtTime(0.9, now + dur - 0.14);
+  master.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+  master.connect(ctx.destination);
+
+  const shaper = ctx.createWaveShaper();
+  shaper.curve = makeGrowlCurve(55);
+  shaper.oversample = '4x';
+  shaper.connect(master);
+
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(750, now);
+  bp.frequency.linearRampToValueAtTime(1050, now + dur);
+  bp.Q.value = 1.1;
+  bp.connect(shaper);
+
+  const osc = ctx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(115, now);
+  osc.frequency.linearRampToValueAtTime(150, now + dur); // rising = more aggression
+
+  // Trill: fast square-wave AM chops the tone into an "RRRR" roll.
+  const trill = ctx.createGain();
+  trill.gain.value = 0.5;
+  const lfo = ctx.createOscillator();
+  lfo.type = 'square';
+  lfo.frequency.setValueAtTime(26, now);
+  lfo.frequency.linearRampToValueAtTime(34, now + dur);
+  const lfoGain = ctx.createGain();
+  lfoGain.gain.value = 0.5;
+  lfo.connect(lfoGain);
+  lfoGain.connect(trill.gain);
+
+  osc.connect(trill);
+  trill.connect(bp);
+
+  osc.start(now); lfo.start(now);
+  osc.stop(now + dur); lfo.stop(now + dur);
 }
 
 function updateHandleAim() {
@@ -294,6 +496,24 @@ function applyWallCollisions() {
   }
 }
 
+// Clamp every point to finite values within a generous bound around the
+// canvas. Recovers gracefully (snaps a runaway point back toward the handle)
+// so a coordinate explosion can never crash the renderer.
+function sanitizeWhip() {
+  if (!whip) return;
+  const hx = mouseX, hy = mouseY;
+  const loX = -W - 4000, hiX = 2 * W + 4000;
+  const loY = -H - 4000, hiY = 2 * H + 4000;
+  for (const p of whip) {
+    if (!Number.isFinite(p.x)) { p.x = hx; p.px = hx; }
+    if (!Number.isFinite(p.y)) { p.y = hy; p.py = hy; }
+    if (p.x < loX) { p.x = loX; p.px = loX; } else if (p.x > hiX) { p.x = hiX; p.px = hiX; }
+    if (p.y < loY) { p.y = loY; p.py = loY; } else if (p.y > hiY) { p.y = hiY; p.py = hiY; }
+    if (!Number.isFinite(p.px)) p.px = p.x;
+    if (!Number.isFinite(p.py)) p.py = p.y;
+  }
+}
+
 // ── Physics step ────────────────────────────────────────────────────────────
 function update() {
   if (!whip) return;
@@ -353,15 +573,22 @@ function update() {
     applyWallCollisions();
   }
 
+  // Safety net: never let non-finite/extreme coordinates reach the canvas.
+  // A fast cross-monitor cursor jump could otherwise spike the physics into
+  // NaN/huge values and crash the GPU compositor on a transparent window.
+  sanitizeWhip();
+
   // Tip velocity for crack detection
   const tip = whip[whip.length - 1];
-  const tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
+  let tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
+  if (!Number.isFinite(tipVel)) tipVel = 0;
 
   if (!dropping && tipVel > P.crackSpeed) {
     const now = Date.now();
     if (now - whipSpawnTime >= P.firstCrackGraceMs && now - lastCrackTime > P.crackCooldownMs) {
       lastCrackTime = now;
       playCrackSound();
+      playGuanzhang();
       window.bridge.whipCrack();
     }
   }
@@ -379,6 +606,8 @@ function update() {
 // ── Rendering ───────────────────────────────────────────────────────────────
 function draw() {
   ctx.clearRect(0, 0, W, H);
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
 
   // Near-invisible fill so the window captures mouse events on Windows
   ctx.fillStyle = `rgba(0,0,0,${P.bgAlpha})`;
@@ -386,10 +615,29 @@ function draw() {
 
   if (!whip) return;
 
-  // White: thin halo on full spline, then extra thickness only over handle links.
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  ctx.strokeStyle = '#fff';
+  if (skin.type === 'tube') drawTubeWhip(); else drawFlatWhip();
+}
+
+// Segment width at index i (the handle→tip taper used across the renderer).
+function segWidth(i) {
+  const t = i / Math.max(1, whip.length - 2);
+  const extra = i < P.handleThickSegments ? P.handleExtraWidth : 0;
+  return lerp(P.lineWidthHandle, P.lineWidthTip, t) + extra;
+}
+
+function bezierSeg(i) {
+  const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+  ctx.beginPath();
+  ctx.moveTo(whip[i].x, whip[i].y);
+  ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+}
+
+// Original flat look: coloured halo/outline + solid core (optional glow).
+function drawFlatWhip() {
+  if (skin.glow) { ctx.shadowColor = skin.glow.color; ctx.shadowBlur = skin.glow.blur; }
+  ctx.strokeStyle = skin.outline;
   if (whip.length >= 2) {
     ctx.beginPath();
     ctx.moveTo(whip[0].x, whip[0].y);
@@ -399,7 +647,6 @@ function draw() {
     }
     ctx.lineWidth = P.lineWidthTip + P.outlineWidth * 2;
     ctx.stroke();
-
     const thickLinks = Math.min(P.handleThickSegments, whip.length - 1);
     if (thickLinks > 0 && P.handleExtraWidth > 0) {
       ctx.beginPath();
@@ -408,35 +655,107 @@ function draw() {
         const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
         ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
       }
-      ctx.lineWidth =
-        P.lineWidthHandle + P.handleExtraWidth + P.outlineWidth * 2;
+      ctx.lineWidth = P.lineWidthHandle + P.handleExtraWidth + P.outlineWidth * 2;
       ctx.stroke();
     }
   }
-
-  ctx.strokeStyle = '#111';
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = skin.core;
   for (let i = 0; i < whip.length - 1; i++) {
-    const t = i / Math.max(1, whip.length - 2);
-    const extra = i < P.handleThickSegments ? P.handleExtraWidth : 0;
-    ctx.lineWidth = lerp(P.lineWidthHandle, P.lineWidthTip, t) + extra;
-    const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
-    ctx.beginPath();
-    ctx.moveTo(whip[i].x, whip[i].y);
-    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+    ctx.lineWidth = segWidth(i);
+    bezierSeg(i);
     ctx.stroke();
+  }
+}
+
+// Material look: each segment is a shaded tube (shadow→highlight→mid across its
+// width) with a dark edge, optional braid cross-hatch, and glowing seam dots.
+function drawTubeWhip() {
+  // overall aura for glowing materials
+  if (skin.glow) {
+    ctx.save();
+    ctx.shadowColor = skin.glow.color; ctx.shadowBlur = skin.glow.blur;
+    ctx.strokeStyle = skin.glow.color; ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(whip[0].x, whip[0].y);
+    for (let i = 0; i < whip.length - 1; i++) {
+      const { cp1x, cp1y, cp2x, cp2y, x2, y2 } = whipSegmentBezier(whip, i);
+      ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x2, y2);
+    }
+    ctx.lineWidth = P.lineWidthTip;
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0;
+
+  for (let i = 0; i < whip.length - 1; i++) {
+    const a = whip[i], b = whip[i + 1];
+    const w = segWidth(i);
+    // dark edge for definition
+    if (skin.edge) {
+      ctx.strokeStyle = skin.edge;
+      ctx.lineWidth = w + 2.5;
+      bezierSeg(i); ctx.stroke();
+    }
+    // shaded tube: linear gradient across the segment's width
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const pxu = -dy / len, pyu = dx / len;
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, hw = w / 2;
+    const grad = ctx.createLinearGradient(mx - pxu * hw, my - pyu * hw, mx + pxu * hw, my + pyu * hw);
+    grad.addColorStop(0.0, skin.shadow);
+    grad.addColorStop(0.34, skin.highlight);
+    grad.addColorStop(0.58, skin.mid);
+    grad.addColorStop(1.0, skin.shadow);
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = w;
+    bezierSeg(i); ctx.stroke();
+    // braid cross-hatch: short diagonal tick, alternating direction per segment
+    if (skin.braid) {
+      const ta = Math.atan2(dy, dx) + (i % 2 ? 0.7 : -0.7);
+      const L = w * 0.85;
+      ctx.strokeStyle = skin.braid.color;
+      ctx.globalAlpha = skin.braid.alpha;
+      ctx.lineWidth = Math.max(1.5, w * 0.16);
+      ctx.beginPath();
+      ctx.moveTo(mx - Math.cos(ta) * L, my - Math.sin(ta) * L);
+      ctx.lineTo(mx + Math.cos(ta) * L, my + Math.sin(ta) * L);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // glowing seam dots spaced along the rope
+  if (skin.seam) {
+    ctx.save();
+    ctx.shadowColor = skin.seam.color; ctx.shadowBlur = skin.seam.blur;
+    ctx.fillStyle = skin.seam.color;
+    for (let i = 1; i < whip.length - 1; i += skin.seam.spacing) {
+      ctx.beginPath();
+      ctx.arc(whip[i].x, whip[i].y, skin.seam.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
 function loop() {
-  update();
-  draw();
+  // Guard the frame so a transient math error can never kill the animation.
+  try {
+    update();
+    draw();
+  } catch (e) { /* skip this frame */ }
   requestAnimationFrame(loop);
 }
 loop();
 
 // ── IPC from main process ───────────────────────────────────────────────────
+window.bridge.onSetSkin(id => { skin = SKINS[id] || SKINS.classic; });
+
 window.bridge.onSpawnWhip(() => {
+  ensureGuanzhang(); // start decoding so the roar is ready by the first crack
   whip = spawnWhip(mouseX || W / 2, mouseY || H / 2);
   dropping = false;
   prevMouseX = mouseX;

@@ -1,4 +1,4 @@
-# OpenWhip
+# Notorious Whip
 
 ![Whip divider](assets/divider.png)
 
@@ -23,6 +23,14 @@ sudo apt install xdotool
 - Click: drop whip.
 - Whip him 😩💢
 - It sends an interrupt (Ctrl-C) and one of 5 encouraging messages!
+- Every crack layers on the 館長 **RRRRRRR** roar.
+
+## Sounds
+
+Each strike plays a random whip crack (`sounds/A–E.mp3`) plus a 館長-style roar.
+The roar is synthesized in-app by default. To use a real recording instead, drop
+your own file at `sounds/guanzhang.mp3` — it's picked up automatically, no code
+changes needed.
 
 ## Roadmap
 

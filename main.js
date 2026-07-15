@@ -1,8 +1,19 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, screen, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFile } = require('child_process');
+
+// ── Single-instance lock ──────────────────────────────────────────────────────
+// The launcher runs detached, so without this every `openwhip` / `npm start`
+// would stack another invisible background tray app. If we don't get the lock,
+// a copy is already running: bail immediately and ask it to pop a whip instead.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+  return;
+}
+app.on('second-instance', () => { try { toggleOverlay(); } catch (e) {} });
+app.on('before-quit', () => { try { globalShortcut.unregisterAll(); } catch (e) {} });
 
 // ── Win32 FFI (Windows only) ────────────────────────────────────────────────
 let keybd_event, VkKeyScanA;
@@ -21,6 +32,20 @@ if (process.platform === 'win32') {
 let tray, overlay;
 let overlayReady = false;
 let spawnQueued = false;
+let macroBusy = false; // serialize interrupt+type so rapid cracks don't clobber each other
+let cursorTimer = null; // polls the OS cursor so the handle follows it without focus
+let trayMenu = null;
+let currentSkin = 'classic';
+// Whip skins the user can pick from the tray. The visual details live in the
+// renderer (overlay.html SKINS); here we only need the id + menu label. To add
+// a skin, add it in both places using the same id.
+const SKINS = [
+  { id: 'classic',   label: 'Classic — black & white' },
+  { id: 'notorious', label: 'Notorious — braided leather + red glow' },
+  { id: 'chrome',    label: 'Chrome — polished metal' },
+  { id: 'gold',      label: 'Gold' },
+  { id: 'neon',      label: 'Neon — cyan' },
+];
 
 const VK_CONTROL = 0x11;
 const VK_RETURN  = 0x0D;
@@ -66,8 +91,11 @@ function refocusPreviousApp() {
 function createTrayIconFallback() {
   const p = path.join(__dirname, 'icon', 'Template.png');
   if (fs.existsSync(p)) {
-    const img = nativeImage.createFromPath(p);
+    let img = nativeImage.createFromPath(p);
     if (!img.isEmpty()) {
+      // Tray/menu-bar icons must be small (~16-22px). A full 512px image can
+      // render blank or oversized in the macOS menu bar, so scale it down.
+      img = img.resize({ width: 22, height: 22, quality: 'best' });
       if (process.platform === 'darwin') img.setTemplateImage(true);
       return img;
     }
@@ -96,6 +124,19 @@ async function getTrayIcon() {
     return createTrayIconFallback();
   }
   if (process.platform === 'darwin') {
+    // Colored menu-bar icon (the 館長 + whip design). Kept as a normal (non-
+    // template) image so it shows in full color; createFromPath auto-loads the
+    // TrayColor@2x.png sibling for Retina. It won't adapt to light/dark, which
+    // is the trade-off for a colored tray icon.
+    const colored = path.join(iconDir, 'TrayColor.png');
+    if (fs.existsSync(colored)) {
+      const img = nativeImage.createFromPath(colored);
+      if (!img.isEmpty()) return img;
+    }
+    // Fall back to the monochrome whip template if the colored icon is missing.
+    const tmpl = createTrayIconFallback();
+    if (!tmpl.isEmpty()) return tmpl;
+    // Fallback to the .icns only if Template.png is missing.
     const file = path.join(iconDir, 'AppIcon.icns');
     if (fs.existsSync(file)) {
       const fromPath = nativeImage.createFromPath(file);
@@ -115,14 +156,36 @@ async function getTrayIcon() {
         console.warn('AppIcon.icns temp copy + thumbnail failed:', e?.message || e);
       }
     }
-    return createTrayIconFallback();
+    return nativeImage.createEmpty();
   }
   return createTrayIconFallback();
 }
 
 // ── Overlay window ──────────────────────────────────────────────────────────
+/** Union of ALL displays (the whole virtual desktop). Covering everything with
+ *  one window means the cursor never leaves the overlay — so moving between
+ *  monitors is continuous instead of a huge coordinate jump that blows up the
+ *  whip physics and crashes the GPU. Also lets you whip across every screen. */
+function virtualDesktopBounds() {
+  try {
+    const displays = screen.getAllDisplays();
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const d of displays) {
+      const b = d.bounds;
+      minX = Math.min(minX, b.x);
+      minY = Math.min(minY, b.y);
+      maxX = Math.max(maxX, b.x + b.width);
+      maxY = Math.max(maxY, b.y + b.height);
+    }
+    if (!Number.isFinite(minX)) return screen.getPrimaryDisplay().bounds;
+    return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  } catch {
+    return screen.getPrimaryDisplay().bounds;
+  }
+}
+
 function createOverlay() {
-  const { bounds } = screen.getPrimaryDisplay();
+  const bounds = virtualDesktopBounds();
   overlay = new BrowserWindow({
     x: bounds.x, y: bounds.y,
     width: bounds.width, height: bounds.height,
@@ -138,10 +201,20 @@ function createOverlay() {
     },
   });
   overlay.setAlwaysOnTop(true, 'screen-saver');
+  // macOS: native-fullscreen apps live in their own Space, so a plain
+  // always-on-top window never shows over them. Joining all Spaces +
+  // visibleOnFullScreen lets the whip appear over fullscreen apps too.
+  if (process.platform === 'darwin') {
+    overlay.setVisibleOnAllWorkspaces(true, {
+      visibleOnFullScreen: true,
+      skipTransformProcessType: true,
+    });
+  }
   overlayReady = false;
   overlay.loadFile('overlay.html');
   overlay.webContents.on('did-finish-load', () => {
     overlayReady = true;
+    overlay.webContents.send('set-skin', currentSkin); // apply the saved skin
     if (spawnQueued && overlay && overlay.isVisible()) {
       spawnQueued = false;
       overlay.webContents.send('spawn-whip');
@@ -152,6 +225,8 @@ function createOverlay() {
     overlay = null;
     overlayReady = false;
     spawnQueued = false;
+    stopCursorTracking();
+    unregisterEscapeHatch();
   });
 }
 
@@ -161,13 +236,121 @@ function toggleOverlay() {
     return;
   }
   if (!overlay) createOverlay();
+  // Re-anchor to the full virtual desktop before showing (handles monitors
+  // being plugged in/out or rearranged since the window was created).
+  const b = virtualDesktopBounds();
+  overlay.setBounds({ x: b.x, y: b.y, width: b.width, height: b.height });
   overlay.show();
+  // The overlay is a full-screen, input-capturing, screen-saver-level window
+  // that even sits above the menu bar — so while it's up, the tray icon is
+  // unreachable. If transparency/compositing ever fails (common on single
+  // integrated-GPU displays) it covers everything opaque with no way out.
+  // Escape is a guaranteed keyboard escape hatch, live only while visible so
+  // it never steals Escape from other apps the rest of the time.
+  registerEscapeHatch();
+  startCursorTracking();
   if (overlayReady) {
     overlay.webContents.send('spawn-whip');
     refocusPreviousApp();
   } else {
     spawnQueued = true;
   }
+}
+
+/** Force-hide the overlay immediately (no drop animation) and drop the Escape
+ *  hatch. Safe to call from any path — click-drop, IPC, or the panic key. */
+function hideOverlayNow() {
+  try { if (overlay) overlay.hide(); } catch (e) {}
+  spawnQueued = false;
+  stopCursorTracking();
+  unregisterEscapeHatch();
+}
+
+function registerEscapeHatch() {
+  try {
+    if (!globalShortcut.isRegistered('Escape')) {
+      globalShortcut.register('Escape', hideOverlayNow);
+    }
+  } catch (e) {
+    console.warn('could not register Escape hatch:', e?.message || e);
+  }
+}
+
+function unregisterEscapeHatch() {
+  try {
+    if (globalShortcut.isRegistered('Escape')) globalShortcut.unregister('Escape');
+  } catch (e) {}
+}
+
+// Push the current cursor position (as window-local CSS px) to the renderer.
+// We poll the OS cursor instead of relying on DOM `mousemove`, because the
+// overlay is a non-focusable background window: once we Cmd+Tab focus back to
+// the user's app (so the crack macro can type there), macOS stops delivering
+// mousemove to the overlay and the handle would otherwise freeze in place.
+// getCursorScreenPoint() and getBounds() are both in DIP, matching the canvas'
+// CSS pixels, so the subtraction lands the handle exactly under the cursor.
+function sendCursor() {
+  if (!overlay || overlay.isDestroyed() || !overlay.isVisible()) return;
+  try {
+    const b = overlay.getBounds();
+    const c = screen.getCursorScreenPoint();
+    overlay.webContents.send('cursor', { x: c.x - b.x, y: c.y - b.y });
+  } catch (e) {}
+}
+
+function startCursorTracking() {
+  stopCursorTracking();
+  sendCursor(); // seed immediately so the first spawn lands under the cursor
+  cursorTimer = setInterval(sendCursor, 16); // ~60 Hz
+}
+
+function stopCursorTracking() {
+  if (cursorTimer) { clearInterval(cursorTimer); cursorTimer = null; }
+}
+
+// ── Skins & persistence ─────────────────────────────────────────────────────
+function configPath() { return path.join(app.getPath('userData'), 'config.json'); }
+
+function loadConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    if (c && typeof c.skin === 'string' && SKINS.some(s => s.id === c.skin)) currentSkin = c.skin;
+  } catch (e) { /* no/invalid config: keep default */ }
+}
+
+function saveConfig() {
+  try {
+    fs.mkdirSync(app.getPath('userData'), { recursive: true });
+    fs.writeFileSync(configPath(), JSON.stringify({ skin: currentSkin }, null, 2));
+  } catch (e) {
+    console.warn('could not save config:', e?.message || e);
+  }
+}
+
+function setSkin(id) {
+  if (!SKINS.some(s => s.id === id)) return;
+  currentSkin = id;
+  saveConfig();
+  if (overlay && !overlay.isDestroyed()) overlay.webContents.send('set-skin', id);
+  rebuildTrayMenu(); // refresh the radio checkmark
+}
+
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: 'Crack the whip 🔥', click: toggleOverlay },
+    { label: 'Skin', submenu: SKINS.map(s => ({
+        label: s.label, type: 'radio', checked: currentSkin === s.id, click: () => setSkin(s.id),
+      })) },
+    { type: 'separator' },
+    { label: 'Quit', click: () => app.quit() },
+  ]);
+}
+
+function rebuildTrayMenu() {
+  trayMenu = buildTrayMenu();
+  // Linux tray backends generally need a context menu bound; on macOS/Windows we
+  // keep left-click free for the whip and pop this up on right-click instead.
+  if (process.platform === 'linux' && tray) tray.setContextMenu(trayMenu);
 }
 
 // ── IPC ─────────────────────────────────────────────────────────────────────
@@ -178,10 +361,24 @@ ipcMain.on('whip-crack', () => {
     console.warn('sendMacro failed:', err?.message || err);
   }
 });
-ipcMain.on('hide-overlay', () => { if (overlay) overlay.hide(); });
+ipcMain.on('hide-overlay', () => hideOverlayNow());
+// Read a bundled sound file for the sandboxed renderer (Web Audio decode).
+// basename() blocks path escapes; returns null if the file is missing.
+ipcMain.handle('read-sound', (_e, name) => {
+  try {
+    return fs.readFileSync(path.join(__dirname, 'sounds', path.basename(String(name || ''))));
+  } catch {
+    return null;
+  }
+});
 
 // ── Macro: immediate Ctrl+C, type "Go FASER", Enter ───────────────────────
 function sendMacro() {
+  // Ignore cracks that arrive while a previous macro is still typing. Two
+  // concurrent System Events keystroke sessions race and silently drop
+  // characters, which is why input sometimes never reached the agent.
+  if (macroBusy) return;
+
   // Pick a random phrase from a list of similar phrases and type it out
   const phrases = [
     'FASTER',
@@ -194,17 +391,35 @@ function sendMacro() {
   ];
   const chosen = phrases[Math.floor(Math.random() * phrases.length)];
 
-  if (process.platform === 'win32') {
-    sendMacroWindows(chosen);
-  } else if (process.platform === 'darwin') {
-    sendMacroMac(chosen);
-  } else if (process.platform === 'linux') {
-    sendMacroLinux(chosen);
+  macroBusy = true;
+  // Watchdog: never let a dropped callback wedge macroBusy=true forever.
+  let finished = false;
+  const watchdog = setTimeout(() => finish(), 3000);
+  function finish() {
+    if (finished) return;
+    finished = true;
+    clearTimeout(watchdog);
+    macroBusy = false;
+  }
+
+  try {
+    if (process.platform === 'win32') {
+      sendMacroWindows(chosen, finish);
+    } else if (process.platform === 'darwin') {
+      sendMacroMac(chosen, finish);
+    } else if (process.platform === 'linux') {
+      sendMacroLinux(chosen, finish);
+    } else {
+      finish();
+    }
+  } catch (e) {
+    console.warn('sendMacro failed:', e?.message || e);
+    finish();
   }
 }
 
-function sendMacroWindows(text) {
-  if (!keybd_event || !VkKeyScanA) return;
+function sendMacroWindows(text, done = () => {}) {
+  if (!keybd_event || !VkKeyScanA) return done();
   const tapKey = vk => {
     keybd_event(vk, 0, 0, 0);
     keybd_event(vk, 0, KEYUP, 0);
@@ -227,39 +442,33 @@ function sendMacroWindows(text) {
   for (const ch of text) tapChar(ch);
   keybd_event(VK_RETURN, 0, 0, 0);
   keybd_event(VK_RETURN, 0, KEYUP, 0);
+  done();
 }
 
-function sendMacroMac(text) {
+function sendMacroMac(text, done = () => {}) {
   const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  const interruptScript = [
+  // Do interrupt → type → submit inside ONE System Events session so focus is
+  // consistent throughout. Internal delays let the agent settle after Ctrl+C and
+  // register the typed text before Return — otherwise the phrase just sits in the
+  // input box instead of being sent.
+  const script = [
     'tell application "System Events"',
     '  key code 8 using {control down}', // Ctrl+C interrupt
-    'end tell'
-  ].join('\n');
-  const typeAndEnterScript = [
-    'tell application "System Events"',
+    '  delay 0.3',
     `  keystroke "${escaped}"`,
-    '  key code 36', // Enter
-    'end tell'
+    '  delay 0.2',
+    '  key code 36', // Return / submit
+    'end tell',
   ].join('\n');
-
-  execFile('osascript', ['-e', interruptScript], err => {
+  execFile('osascript', ['-e', script], err => {
     if (err) {
       console.warn('mac macro failed (enable Accessibility for terminal/app):', err.message);
-      return;
     }
-
-    setTimeout(() => {
-      execFile('osascript', ['-e', typeAndEnterScript], err2 => {
-        if (err2) {
-          console.warn('mac macro failed (enable Accessibility for terminal/app):', err2.message);
-        }
-      });
-    }, 300);
+    done();
   });
 }
 
-function sendMacroLinux(text) {
+function sendMacroLinux(text, done = () => {}) {
   execFile(
     'xdotool',
     [
@@ -271,20 +480,36 @@ function sendMacroLinux(text) {
       if (err) {
         console.warn('linux macro failed. Install xdotool:', err.message);
       }
+      done();
     }
   );
 }
 
 // ── App lifecycle ───────────────────────────────────────────────────────────
 app.whenReady().then(async () => {
+  // Tray-only utility: hide from the Dock and run as an accessory app. This
+  // also stops activating Notorious Whip from kicking a fullscreen app out of its
+  // Space when the overlay appears.
+  if (process.platform === 'darwin' && app.dock) app.dock.hide();
+
   tray = new Tray(await getTrayIcon());
-  tray.setToolTip('OpenWhip - click for whip');
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Quit', click: () => app.quit() },
-    ])
-  );
+  tray.setToolTip('Notorious Whip — left-click to crack the whip, right-click for menu');
+
+  // A short label next to the icon so people can actually find it in a crowded
+  // menu bar (the whip glyph alone is a thin monochrome line that's easy to
+  // miss, or gets tucked behind the notch).
+  if (process.platform === 'darwin') tray.setTitle(' Notorious Whip');
+
+  // Menu offers an explicit "Crack the whip" plus a "Skin" picker. Built after
+  // loading the saved skin so the right radio item starts checked.
+  loadConfig();
+  rebuildTrayMenu();
+
+  // macOS/Windows: keep left-click free for the whip and pop the menu on
+  // right-click (setContextMenu would hijack the left-click on macOS). Linux
+  // already got the context menu bound in rebuildTrayMenu().
   tray.on('click', toggleOverlay);
+  tray.on('right-click', () => tray.popUpContextMenu(trayMenu));
 });
 
 app.on('window-all-closed', e => e.preventDefault()); // keep alive in tray
