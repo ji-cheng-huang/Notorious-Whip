@@ -56,7 +56,7 @@ every launch. Add your own by adding a matching entry to `SKINS` in both `main.j
 
 ## Sounds
 
-Each strike plays a random whip crack (`sounds/A–E.mp3`) layered with a 館長-style roar.
+Each strike plays a random whip crack (`sounds/A–E.mp3`) layered with a Guanzhang-style roar.
 A real recording ships at `sounds/guanzhang.mp3`; if it's missing or fails to decode,
 the roar is synthesized in-app as a fallback — no code changes needed.
 
